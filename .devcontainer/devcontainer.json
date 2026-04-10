@@ -1,0 +1,46 @@
+{
+  "name": "gpu-service-manager devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/universal:5",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/nvidia-cuda:3": {
+      "cudaVersion": "12.5"
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "installMethod": "apt"
+    },
+    "ghcr.io/jsburckhardt/devcontainer-features/codex:1": {}
+  },
+  "init": true,
+  "privileged": false,
+  "overrideCommand": false,
+  "containerEnv": {
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "GitHub.vscode-pull-request-github",
+        "github.vscode-github-actions",
+        "openai.chatgpt"
+      ]
+    }
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "4gb",
+    "storage": "32gb"
+  },
+  "forwardPorts": [80, 8080],
+  "runArgs": [
+    "--gpus",
+    "all"
+  ]
+}

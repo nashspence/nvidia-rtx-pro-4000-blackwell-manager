@@ -1,0 +1,16 @@
+services:
+  gpu-service-manager:
+    build: .
+    image: gpu-service-manager:latest
+    container_name: gpu-service-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      GPU_HOST_ROOT: ${GPU_HOST_ROOT}
+      GPU_CONTAINER_ROOT: /gpu
+      DEFAULT_WAIT_S: "900"
+      DEFAULT_LEASE_TTL_S: "1800"
+    volumes:
+      - ${GPU_HOST_ROOT}:/gpu
+      - /var/run/docker.sock:/var/run/docker.sock
