@@ -5,8 +5,6 @@ services:
       - sh
       - -c
       - mkdir -p /www && printf 'ok' >/www/index.html && exec httpd -f -p 8080 -h /www
-    labels:
-      gpu.healthcheck-master: "true"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080"]
       interval: 1s

@@ -1,21 +1,20 @@
 # GPU Service Manager
 
-`gpu-service-manager` is a small FastAPI service that keeps a single GPU host predictable by allowing only one Docker Compose service stack to hold the GPU lease at a time.
+`gpu-service-manager` is a small FastAPI service that keeps a single GPU host predictable by allowing only one Docker Compose stack to hold the GPU lease at a time.
 
-The practical goal is simple: if you have one NVIDIA RTX Pro 4000 Blackwell and several heavy stacks that can each push VRAM usage hard, this gives you a clean way to run one known stack at a time and avoid accidental overlap and OOM churn.
+The practical goal is simple: if you have one GPU box and several heavyweight Compose stacks that can each consume most of the VRAM, this gives you a clean way to run one known stack at a time and avoid overlap and OOM churn.
 
 ## What It Does
 
-- Discovers candidate service stacks under `services/<target>/`
-- Starts exactly one target stack at a time with `docker compose up -d`
-- Waits for one designated container healthcheck before declaring the stack ready
+- Starts exactly one configured Compose stack at a time with `docker compose up -d`
+- Waits until every container in the selected Compose stack is either healthy or running without a Docker healthcheck
 - Persists lease and queue state on disk
 - Serializes access so callers cannot accidentally bring up multiple GPU-heavy stacks at once
 - Supports queued handoff when the GPU is busy
 
 ## How It Works
 
-Each managed target is a Docker Compose project. A client calls `POST /acquire` to request a target. If the GPU is idle, that target is started and a lease is issued. If the GPU is already leased, the caller can optionally join a priority queue.
+Each managed target is configured in `GPU_SERVICE_CONFIG_YAML`. A client calls `POST /acquire` to request a target. If the GPU is idle, that stack is started and a lease is issued. If the GPU is already leased, the caller can optionally join a priority queue.
 
 When the active lease is released, the queue head gets a short claim window. Only that queued token can claim the GPU during that window. Fresh callers cannot skip the queue.
 
@@ -23,33 +22,57 @@ The manager enforces a single active stack. If a new target is acquired, any oth
 
 ## Service Contract
 
-Each target must live in its own directory under `services/` and include one supported Compose filename:
+Managed services are defined by YAML stored in the `GPU_SERVICE_CONFIG_YAML` environment variable. Each entry supplies:
 
-- `docker-compose.yml`
-- `docker-compose.yaml`
-- `compose.yml`
-- `compose.yaml`
+- `path`: the absolute path to that stack’s Compose file on the host
+- `name`: optional target name used by the API. If omitted, the manager uses the Compose file’s parent directory name.
+- A list entry may also be just a string path to the Compose file.
 
-Exactly one service in that Compose project must be marked as the readiness master:
+Example:
 
 ```yaml
 services:
-  api:
-    labels:
-      gpu.healthcheck-master: "true"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+  - name: comfyui
+    path: /opt/stacks/comfyui/docker-compose.yml
+  - /srv/ml/whisperx/compose.yaml
 ```
 
-That labeled container is the one inspected for Docker health. Acquire fails if:
+The manager does not require any custom labels inside the managed stacks. Existing Compose projects can stay unchanged. Readiness succeeds once every container in the stack is either:
 
-- no service has the label
-- more than one service has the label
-- the labeled service has no Docker `healthcheck`
-- the labeled service becomes unhealthy or exits
+- `healthy`
+- `running` with no Docker healthcheck defined
+
+Acquire fails if:
+
+- the configured Compose file is not visible inside the manager container
+- any container in the stack becomes unhealthy or exits
+
+## Relative Paths
+
+To keep relative paths inside existing Compose files working unchanged, mount each managed stack into the manager container at the same absolute path it has on the host.
+
+This matters for Compose features like:
+
+- `build: .`
+- `env_file: .env`
+- relative bind mounts such as `./models:/models`
+- includes or other file references resolved relative to the project directory
+
+The manager invokes Docker as:
+
+- `docker compose -f <configured path>`
+- with `--project-directory <compose file parent>`
+
+That preserves Compose’s normal relative-path behavior, but only if the manager container can see the stack at that same absolute path.
+
+A good convention is to mount a common parent directory once, for example:
+
+```yaml
+volumes:
+  - /opt/stacks:/opt/stacks:ro
+```
+
+If stacks live in unrelated places, mount each relevant parent directory individually at its original absolute path.
 
 ## Repository Layout
 
@@ -67,7 +90,7 @@ That labeled container is the one inspected for Docker health. Acquire fails if:
                 └── docker-compose.yml
 ```
 
-The repository includes `tests/fixtures/services/dummy-*` targets used for local integration and stress testing. Production service stacks should live outside the repository in whatever host directory you mount as `${GPU_HOST_SERVICES_DIR}`.
+The repository includes `tests/fixtures/services/dummy-*` targets used for local integration and stress testing.
 
 ## Configuration
 
@@ -75,19 +98,15 @@ The manager uses these environment variables:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `GPU_HOST_SERVICES_DIR` | yes | none | Host path containing target Compose projects and optional `.env` |
-| `GPU_HOST_RUNTIME_DIR` | yes | none | Host path used for persisted lease and queue state |
-| `GPU_SERVICES_DIR` | no | `/services` | Services path inside the manager container |
+| `GPU_SERVICE_CONFIG_YAML` | yes | none | YAML that defines the managed Compose stacks |
 | `GPU_RUNTIME_DIR` | no | `/runtime` | Runtime state path inside the manager container |
-| `GPU_ENV_FILE` | no | `/services/.env` | Optional env file passed to every `docker compose` invocation |
+| `GPU_ENV_FILE` | no | none | Optional extra env file passed to every `docker compose` invocation |
 | `DEFAULT_WAIT_S` | no | `900` | Default readiness wait timeout for `acquire` |
 | `DEFAULT_LEASE_TTL_S` | no | `1800` | Default lease lifetime |
 | `QUEUE_CLAIM_WINDOW_S` | no | `10` | How long the queue head has to claim the GPU after release |
 | `DOCKER_SOCK` | no | `/var/run/docker.sock` | Docker socket path |
-| `HEALTHCHECK_MASTER_LABEL` | no | `gpu.healthcheck-master` | Label key used to choose readiness master |
-| `HEALTHCHECK_MASTER_VALUE` | no | `true` | Label value used to choose readiness master |
 
-If `${GPU_ENV_FILE}` exists, it is passed to every `docker compose` invocation with `--env-file`.
+If `GPU_ENV_FILE` is set, that file must also be visible inside the manager container at the same absolute path as the host.
 
 ## Running It
 
@@ -97,9 +116,7 @@ The latest published container image is:
 ghcr.io/nashspence/gpu-service-manager:latest
 ```
 
-For a normal deployment, use a minimal `docker-compose.yml` and `.env` like this:
-
-`docker-compose.yml`
+For a normal deployment, use a minimal `docker-compose.yml` like this:
 
 ```yaml
 services:
@@ -110,19 +127,16 @@ services:
     ports:
       - "8080:8080"
     environment:
-      GPU_HOST_SERVICES_DIR: ${GPU_HOST_SERVICES_DIR}
-      GPU_HOST_RUNTIME_DIR: ${GPU_HOST_RUNTIME_DIR}
+      GPU_RUNTIME_DIR: /runtime
+      GPU_SERVICE_CONFIG_YAML: |
+        services:
+          - name: comfyui
+            path: /opt/stacks/comfyui/docker-compose.yml
+          - /opt/stacks/whisperx/compose.yaml
     volumes:
-      - ${GPU_HOST_SERVICES_DIR}:/services
-      - ${GPU_HOST_RUNTIME_DIR}:/runtime
+      - /opt/stacks:/opt/stacks:ro
+      - /opt/gpu-service-manager/runtime:/runtime
       - /var/run/docker.sock:/var/run/docker.sock
-```
-
-`.env`
-
-```dotenv
-GPU_HOST_SERVICES_DIR=/opt/gpu-service-manager/services
-GPU_HOST_RUNTIME_DIR=/opt/gpu-service-manager/runtime
 ```
 
 Then start the manager:
@@ -131,21 +145,21 @@ Then start the manager:
 docker compose up -d
 ```
 
-This configuration runs the manager on port `8080` and mounts:
+This configuration mounts:
 
-- `${GPU_HOST_SERVICES_DIR}` at `/services`
-- `${GPU_HOST_RUNTIME_DIR}` at `/runtime`
+- `/opt/stacks` at the same absolute path so existing relative paths in the managed stacks still work
+- `/opt/gpu-service-manager/runtime` at `/runtime`
 - `/var/run/docker.sock`
 
-For local development from this repository, you can still build and run the included top-level Compose file:
+For local development from this repository:
 
 ```bash
-export GPU_HOST_SERVICES_DIR="$PWD/tests/fixtures/services"
+export REPO_ROOT="$PWD"
 export GPU_HOST_RUNTIME_DIR="$PWD/tests/fixtures/runtime"
 docker compose up -d --build
 ```
 
-Those paths are test fixtures for local development only. For real usage, point `${GPU_HOST_SERVICES_DIR}` and `${GPU_HOST_RUNTIME_DIR}` at host directories outside the repository.
+The included top-level [`docker-compose.yml`](/workspaces/gpu-service-manager/docker-compose.yml) is a local-dev example that configures the fixture stacks through `GPU_SERVICE_CONFIG_YAML`.
 
 ## API
 
@@ -160,7 +174,7 @@ Returns:
 - current public lease state
 - current queue state
 - current running service status, if any
-- discovered services
+- configured managed services
 
 ### `POST /acquire`
 
@@ -171,7 +185,7 @@ Example:
 ```bash
 curl -X POST http://localhost:8080/acquire \
   -H 'content-type: application/json' \
-  -d '{"target":"my-stack","owner":"me"}'
+  -d '{"target":"comfyui","owner":"me"}'
 ```
 
 Refresh an active lease:
@@ -179,7 +193,7 @@ Refresh an active lease:
 ```bash
 curl -X POST http://localhost:8080/acquire \
   -H 'content-type: application/json' \
-  -d '{"target":"my-stack","lease_token":"<active-token>"}'
+  -d '{"target":"comfyui","lease_token":"<active-token>"}'
 ```
 
 Join the queue when the GPU is busy:
@@ -187,14 +201,14 @@ Join the queue when the GPU is busy:
 ```bash
 curl -X POST http://localhost:8080/acquire \
   -H 'content-type: application/json' \
-  -d '{"target":"my-stack","owner":"batch-job","priority":100}'
+  -d '{"target":"whisperx","owner":"batch-job","priority":100}'
 ```
 
 Request body:
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `target` | yes | Service target directory name under `services/` |
+| `target` | yes | Managed target name from `GPU_SERVICE_CONFIG_YAML` |
 | `owner` | no | Human-readable owner string |
 | `lease_token` | no | Existing active lease token or queued token |
 | `lease_ttl_s` | no | Lease TTL override |
@@ -258,32 +272,3 @@ Install dependencies:
 ```bash
 python3 -m pip install -r requirements-dev.txt
 ```
-
-Run the full test suite:
-
-```bash
-python3 -m pytest --cov=app --cov-report=term-missing
-```
-
-Run the live HTTP stress test only:
-
-```bash
-python3 -m pytest tests/test_gpu_service_manager_stress.py -q
-```
-
-## Test Coverage
-
-The test suite exercises:
-
-- service discovery across all supported Compose filenames
-- happy-path acquire, status, refresh, and release
-- readiness master validation failures
-- queue fairness and claim-window behavior
-- live multi-worker stress with concurrent enqueue, status polling, bad-token retries, and claim races
-
-## Limitations
-
-- This manager coordinates only the Compose projects it knows about under `services/`.
-- It does not stop unrelated containers running outside that set.
-- It assumes Docker healthchecks are a reliable signal for stack readiness.
-- It is designed for one managed GPU host, not distributed scheduling across multiple machines.

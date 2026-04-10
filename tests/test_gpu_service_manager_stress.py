@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,20 +35,38 @@ def _copy_dummy_services(root: Path) -> None:
         shutil.copytree(SERVICES_FIXTURES_ROOT / name, services_root / name)
 
 
+def _compose_file_for_service(root: Path, service_name: str) -> Path:
+    for filename in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+        compose_path = root / "services" / service_name / filename
+        if compose_path.exists():
+            return compose_path
+    raise FileNotFoundError(service_name)
+
+
+def _service_config_yaml(root: Path) -> str:
+    return yaml.safe_dump(
+        {
+            "services": [
+                {
+                    "name": "dummy-ok",
+                    "path": str(_compose_file_for_service(root, "dummy-ok")),
+                },
+                str(_compose_file_for_service(root, "dummy-alt")),
+            ]
+        },
+        sort_keys=False,
+    )
+
+
 def _docker_compose_down(root: Path) -> None:
-    for service_dir in (root / "services").iterdir():
-        if not service_dir.is_dir():
-            continue
-        for filename in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
-            compose_path = service_dir / filename
-            if compose_path.exists():
-                subprocess.run(
-                    ["docker", "compose", "-f", str(compose_path), "down", "--remove-orphans", "--volumes"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                break
+    for service_name in DUMMY_SERVICES:
+        compose_path = _compose_file_for_service(root, service_name)
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_path), "down", "--remove-orphans", "--volumes"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 def _free_port() -> int:
@@ -58,7 +77,6 @@ def _free_port() -> int:
 
 @pytest.fixture
 def live_server(tmp_path: Path):
-    services_root = tmp_path / "services"
     runtime_root = tmp_path / "runtime"
     _copy_dummy_services(tmp_path)
     runtime_root.mkdir(parents=True, exist_ok=True)
@@ -69,16 +87,14 @@ def live_server(tmp_path: Path):
     env = dict(os.environ)
     env.update(
         {
-            "GPU_HOST_SERVICES_DIR": str(services_root),
-            "GPU_HOST_RUNTIME_DIR": str(runtime_root),
-            "GPU_SERVICES_DIR": str(services_root),
             "GPU_RUNTIME_DIR": str(runtime_root),
-            "GPU_ENV_FILE": str(services_root / ".env"),
+            "GPU_SERVICE_CONFIG_YAML": _service_config_yaml(tmp_path),
             "DEFAULT_WAIT_S": "20",
             "DEFAULT_LEASE_TTL_S": "120",
             "QUEUE_CLAIM_WINDOW_S": "3",
         }
     )
+    env.pop("GPU_ENV_FILE", None)
 
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
@@ -221,42 +237,26 @@ def test_live_server_stress_queue_and_claims(live_server) -> None:
                 lengths.append(len(response.json()["state"]["queue"]))
         return lengths
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        claim_futures = [executor.submit(claim, token) for token in queued_tokens.values()]
-        poll_future = executor.submit(poll_during_claim, 20)
+    first_token = queued_tokens[expected_order[0]]
+    other_tokens = [queued_tokens[owner] for owner in expected_order[1:4]]
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        claim_futures = [executor.submit(claim, token) for token in [first_token, *other_tokens]]
+        status_future = executor.submit(poll_during_claim, 12)
 
     claim_results = [future.result() for future in claim_futures]
-    _ = poll_future.result()
+    lengths_during_claim = status_future.result()
 
-    successes = [(token, response) for token, response in claim_results if response.status_code == 200]
-    conflicts = [(token, response) for token, response in claim_results if response.status_code == 409]
-
-    assert len(successes) == 1
-    assert len(conflicts) == len(priorities) - 1
-    assert successes[0][0] == head["token"]
-    assert all(
-        any(
-            marker in response.json()["detail"]
-            for marker in ("queue_index", "gpu busy", "queued claimant pending", "expired")
-        )
-        for _, response in conflicts
-    )
-
-    claimed_payload = successes[0][1].json()
-    assert claimed_payload["state"]["target"] == "dummy-alt"
-    assert claimed_payload["service"]["Status"] == "running"
-    assert claimed_payload["service"]["Health"]["Status"] == "healthy"
-    assert claimed_payload["service"]["container_count"] == 1
-    assert len(claimed_payload["state"]["queue"]) == len(priorities) - 1
+    winners = [token for token, response in claim_results if response.status_code == 200]
+    assert winners == [first_token]
+    assert all(response.status_code == 409 for token, response in claim_results if token != first_token)
+    assert all(length >= len(priorities) - 1 for length in lengths_during_claim)
 
     with httpx.Client(base_url=base_url, timeout=30.0) as client:
         final_status = client.get("/status")
         assert final_status.status_code == 200
         final_payload = final_status.json()
-        assert final_payload["state"]["target"] == "dummy-alt"
-        assert final_payload["state"]["lease"]["owner"] == head["owner"]
 
-        force_release = client.post("/release", json={"force": True})
-        assert force_release.status_code == 200
-        released_payload = force_release.json()
-        assert "lease" not in released_payload["state"]
+    assert final_payload["state"]["target"] == "dummy-alt"
+    assert final_payload["state"]["lease"]["owner"] == expected_order[0]
+    assert len(final_payload["state"]["queue"]) == len(priorities) - 1

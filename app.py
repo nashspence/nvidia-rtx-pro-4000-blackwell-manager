@@ -7,9 +7,11 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -48,29 +50,25 @@ def normalize_seconds(value: int | float | str | None, default: float, name: str
     return seconds
 
 
-SERVICES_DIR = Path(os.getenv("GPU_SERVICES_DIR", "/services"))
 RUNTIME_DIR = Path(os.getenv("GPU_RUNTIME_DIR", "/runtime"))
 LOCK_FILE = RUNTIME_DIR / "lease.lock"
 STATE_FILE = RUNTIME_DIR / "state.json"
 
-HOST_SERVICES_DIR = Path(os.environ["GPU_HOST_SERVICES_DIR"])
-HOST_RUNTIME_DIR = Path(os.environ["GPU_HOST_RUNTIME_DIR"])
-ENV_FILE = Path(os.getenv("GPU_ENV_FILE", str(SERVICES_DIR / ".env")))
+SERVICE_CONFIG_ENV_VAR = "GPU_SERVICE_CONFIG_YAML"
+SERVICE_CONFIG_YAML = os.getenv(SERVICE_CONFIG_ENV_VAR, "")
+ENV_FILE = Path(os.getenv("GPU_ENV_FILE")).expanduser() if os.getenv("GPU_ENV_FILE") else None
 
 DEFAULT_WAIT_S = float(os.getenv("DEFAULT_WAIT_S", "900"))
 DEFAULT_LEASE_TTL_S = float(os.getenv("DEFAULT_LEASE_TTL_S", "1800"))
 QUEUE_CLAIM_WINDOW_S = int(os.getenv("QUEUE_CLAIM_WINDOW_S", "10"))
 DOCKER_SOCK = os.getenv("DOCKER_SOCK", "/var/run/docker.sock")
-HEALTHCHECK_MASTER_LABEL = os.getenv("HEALTHCHECK_MASTER_LABEL", "gpu.healthcheck-master")
-HEALTHCHECK_MASTER_VALUE = os.getenv("HEALTHCHECK_MASTER_VALUE", "true")
-
-COMPOSE_FILENAMES = (
-    "docker-compose.yml",
-    "docker-compose.yaml",
-    "compose.yml",
-    "compose.yaml",
-)
 FAILED_STATES = {"exited", "dead"}
+
+
+@dataclass(frozen=True)
+class ManagedService:
+    name: str
+    compose_file: Path
 
 
 class AcquireRequest(BaseModel):
@@ -95,24 +93,105 @@ def ensure_dirs() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def discover_services() -> dict[str, str]:
-    services: dict[str, str] = {}
-    if not SERVICES_DIR.exists():
-        return services
-    for child in sorted(SERVICES_DIR.iterdir()):
-        if not child.is_dir():
-            continue
-        compose_path = next((child / name for name in COMPOSE_FILENAMES if (child / name).exists()), None)
-        if compose_path:
-            services[child.name] = str(compose_path)
+def load_managed_services() -> dict[str, ManagedService]:
+    raw = SERVICE_CONFIG_YAML.strip()
+    if not raw:
+        return {}
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} is not valid YAML: {exc}") from exc
+    if loaded in (None, ""):
+        return {}
+
+    entries = loaded.get("services") if isinstance(loaded, dict) and "services" in loaded else loaded
+    normalized_entries: list[dict[str, Any]] = []
+
+    if isinstance(entries, dict):
+        for name, value in entries.items():
+            if isinstance(value, str):
+                normalized_entries.append({"name": str(name), "path": value})
+                continue
+            if not isinstance(value, dict):
+                raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} entry for {name!r} must be a mapping or a string path")
+            item = dict(value)
+            item.setdefault("name", str(name))
+            normalized_entries.append(item)
+    elif isinstance(entries, list):
+        for value in entries:
+            if isinstance(value, str):
+                normalized_entries.append({"path": value})
+                continue
+            if not isinstance(value, dict):
+                raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} list entries must be mappings or string paths")
+            normalized_entries.append(dict(value))
+    else:
+        raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} must be a mapping or a list of mappings")
+
+    services: dict[str, ManagedService] = {}
+    for item in normalized_entries:
+        compose_file_value = item.get("path")
+        if not compose_file_value:
+            entry_name = str(item.get("name") or "<unnamed>").strip()
+            raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} entry {entry_name!r} must define path")
+
+        compose_file = Path(str(compose_file_value)).expanduser()
+        if not compose_file.is_absolute():
+            raise ValueError(
+                f"{SERVICE_CONFIG_ENV_VAR} entry path must be absolute: {compose_file}"
+            )
+        service_name = str(item.get("name") or compose_file.parent.name).strip()
+        if not service_name:
+            raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} entries must define name or use a path with a parent directory")
+        if service_name in services:
+            raise ValueError(f"{SERVICE_CONFIG_ENV_VAR} contains duplicate name: {service_name}")
+
+        services[service_name] = ManagedService(
+            name=service_name,
+            compose_file=compose_file,
+        )
     return services
 
 
+MANAGED_SERVICES = load_managed_services()
+
+
+def discover_services() -> dict[str, dict[str, str]]:
+    return {
+        name: {
+            "compose_file": str(service.compose_file),
+            "name": service.name,
+        }
+        for name, service in MANAGED_SERVICES.items()
+    }
+
+
+def service_config(target: str) -> ManagedService:
+    try:
+        return MANAGED_SERVICES[target]
+    except KeyError as exc:
+        raise ValueError(f"unknown target: {target}") from exc
+
+
 def compose_file(target: str) -> Path:
-    services = discover_services()
-    if target not in services:
-        raise ValueError(f"unknown target: {target}")
-    return Path(services[target])
+    return service_config(target).compose_file
+
+
+def compose_file_for_cli(target: str) -> Path:
+    compose_path = compose_file(target)
+    if compose_path.exists():
+        return compose_path
+    raise RuntimeError(
+        (
+            f"compose file is not visible inside gpu-service-manager: {compose_path}. "
+            f"Bind mount the compose file's parent directory into the manager container "
+            f"at the same absolute path as the host."
+        )
+    )
+
+
+def compose_project_dir_for_cli(target: str) -> Path:
+    return compose_file_for_cli(target).parent
 
 
 def docker_env(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -120,13 +199,12 @@ def docker_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env.update(
         {
             "DOCKER_HOST": f"unix://{DOCKER_SOCK}",
-            "GPU_HOST_SERVICES_DIR": str(HOST_SERVICES_DIR),
-            "GPU_HOST_RUNTIME_DIR": str(HOST_RUNTIME_DIR),
-            "GPU_SERVICES_DIR": str(SERVICES_DIR),
             "GPU_RUNTIME_DIR": str(RUNTIME_DIR),
-            "GPU_ENV_FILE": str(ENV_FILE),
+            SERVICE_CONFIG_ENV_VAR: SERVICE_CONFIG_YAML,
         }
     )
+    if ENV_FILE:
+        env["GPU_ENV_FILE"] = str(ENV_FILE)
     if extra:
         env.update(extra)
     return env
@@ -136,16 +214,34 @@ def docker(*args: str, check: bool = True, capture_output: bool = False, quiet: 
     return run(["docker", *args], check=check, capture_output=capture_output, quiet=quiet, env=docker_env())
 
 
+def compose_env_file_for_cli() -> Path | None:
+    if not ENV_FILE:
+        return None
+    if ENV_FILE.exists():
+        return ENV_FILE
+    raise RuntimeError(
+        (
+            f"GPU_ENV_FILE is not visible inside gpu-service-manager: {ENV_FILE}. "
+            f"Bind mount that file or its parent directory into the manager container "
+            f"at the same absolute path as the host."
+        )
+    )
+
+
 def compose_env_file_args() -> list[str]:
-    return ["--env-file", str(ENV_FILE)] if ENV_FILE.exists() else []
+    env_file = compose_env_file_for_cli()
+    return ["--env-file", str(env_file)] if env_file else []
 
 
 def compose(target: str, *args: str, check: bool = True, capture_output: bool = False, quiet: bool = False) -> subprocess.CompletedProcess[str]:
+    compose_path = compose_file_for_cli(target)
     return docker(
         "compose",
         *compose_env_file_args(),
+        "--project-directory",
+        str(compose_path.parent),
         "-f",
-        str(compose_file(target)),
+        str(compose_path),
         *args,
         check=check,
         capture_output=capture_output,
@@ -166,44 +262,30 @@ def inspect_maybe(name: str | None) -> dict[str, Any] | None:
         return None
 
 
-def project_container_ids(target: str) -> list[str]:
-    cp = compose(target, "ps", "-q", check=False, capture_output=True)
+def project_container_ids(target: str, service_name: str | None = None) -> list[str]:
+    args = ["ps", "-q"]
+    if service_name:
+        args.append(service_name)
+    cp = compose(target, *args, check=False, capture_output=True)
     return [line.strip() for line in cp.stdout.splitlines() if line.strip()]
 
 
-def find_healthcheck_master_container_id(target: str) -> str:
-    matches: list[str] = []
-    for container_id in project_container_ids(target):
-        info = inspect_maybe(container_id)
-        labels = ((info or {}).get("Config") or {}).get("Labels") or {}
-        if labels.get(HEALTHCHECK_MASTER_LABEL) == HEALTHCHECK_MASTER_VALUE:
-            matches.append(container_id)
-    if not matches:
-        raise RuntimeError(
-            error_payload(
-                target,
-                message=(
-                    f"compose project must define exactly one service with label "
-                    f"{HEALTHCHECK_MASTER_LABEL}={HEALTHCHECK_MASTER_VALUE}"
-                ),
-            )
-        )
-    if len(matches) > 1:
-        raise RuntimeError(
-            error_payload(
-                target,
-                message=(
-                    f"compose project has multiple services with label "
-                    f"{HEALTHCHECK_MASTER_LABEL}={HEALTHCHECK_MASTER_VALUE}"
-                ),
-            )
-        )
-    return matches[0]
+def configured_service_names(target: str) -> list[str]:
+    cp = compose(target, "config", "--services", check=False, capture_output=True)
+    output = ((cp.stdout or "") + (cp.stderr or "")).strip()
+    if cp.returncode != 0:
+        raise RuntimeError(output or error_payload(target, message="unable to inspect compose services"))
+    return [line.strip() for line in cp.stdout.splitlines() if line.strip()]
 
 
-def inspect_target_master_maybe(target: str) -> dict[str, Any] | None:
+def inspect_project_containers(target: str) -> list[dict[str, Any]]:
+    return [info for container_id in project_container_ids(target) if (info := inspect_maybe(container_id))]
+
+
+def inspect_target_maybe(target: str) -> list[dict[str, Any]] | None:
     try:
-        return inspect_maybe(find_healthcheck_master_container_id(target))
+        infos = inspect_project_containers(target)
+        return infos or None
     except RuntimeError:
         return None
 
@@ -253,8 +335,8 @@ def load_state() -> dict[str, Any]:
     if target and target not in discover_services():
         return {}
     if target:
-        info = inspect_target_master_maybe(target)
-        if info and info.get("State", {}).get("Status") in FAILED_STATES:
+        infos = inspect_target_maybe(target)
+        if infos and any(info.get("State", {}).get("Status") in FAILED_STATES for info in infos):
             return {}
     if state.get("lease") and not active_lease(state):
         state = dict(state)
@@ -288,7 +370,11 @@ def require_lease_token(state: dict[str, Any], lease_token: str) -> dict[str, An
 
 
 def endpoint_for(target: str) -> dict[str, Any]:
-    return {"compose_file": str(compose_file(target))}
+    managed_service = service_config(target)
+    return {
+        "compose_file": str(managed_service.compose_file),
+        "name": managed_service.name,
+    }
 
 
 def down_target(target: str) -> None:
@@ -306,7 +392,10 @@ def up_target(target: str) -> None:
 
 
 def current_logs_tail(target: str, lines: int = 80) -> str:
-    cp = compose(target, "logs", "--no-color", "--tail", str(lines), check=False, capture_output=True)
+    try:
+        cp = compose(target, "logs", "--no-color", "--tail", str(lines), check=False, capture_output=True)
+    except RuntimeError:
+        return ""
     return ((cp.stdout or "") + (cp.stderr or "")).strip()
 
 
@@ -321,13 +410,16 @@ def error_payload(target: str, *, message: str | None = None, state: dict[str, A
 
 @contextmanager
 def stream_compose_logs(target: str) -> Iterator[None]:
+    compose_path = compose_file_for_cli(target)
     proc = subprocess.Popen(
         [
             "docker",
             "compose",
             *compose_env_file_args(),
+            "--project-directory",
+            str(compose_path.parent),
             "-f",
-            str(compose_file(target)),
+            str(compose_path),
             "logs",
             "-f",
             "--tail",
@@ -349,35 +441,38 @@ def stream_compose_logs(target: str) -> Iterator[None]:
                 proc.wait()
 
 
-def wait_service(target: str, timeout_s: int | float | str | None) -> dict[str, Any]:
+def wait_service(target: str, timeout_s: int | float | str | None) -> list[dict[str, Any]]:
     deadline = time.time() + normalize_seconds(timeout_s, DEFAULT_WAIT_S, "wait_s")
+    expected_services = configured_service_names(target)
     while time.time() < deadline:
-        master_id = find_healthcheck_master_container_id(target)
-        info = inspect_maybe(master_id)
-        if not info:
+        containers_by_service: dict[str, list[dict[str, Any]]] = {}
+        for service_name in expected_services:
+            infos = [info for container_id in project_container_ids(target, service_name) if (info := inspect_maybe(container_id))]
+            if infos:
+                containers_by_service[service_name] = infos
+
+        if len(containers_by_service) < len(expected_services):
             time.sleep(1)
             continue
-        state = info.get("State", {})
-        status = state.get("Status")
-        health = state.get("Health")
-        health_status = health.get("Status") if health else None
-        if status in FAILED_STATES:
-            raise RuntimeError(error_payload(target, state=state))
-        if not health:
-            raise RuntimeError(
-                error_payload(
-                    target,
-                    message=(
-                        f"healthcheck master is missing a Docker healthcheck: "
-                        f"label {HEALTHCHECK_MASTER_LABEL}={HEALTHCHECK_MASTER_VALUE}"
-                    ),
-                    state=state,
-                )
-            )
-        if health_status == "unhealthy":
-            raise RuntimeError(error_payload(target, state=state))
-        if status == "running" and health_status == "healthy":
-            return state
+
+        all_infos = [info for infos in containers_by_service.values() for info in infos]
+        all_ready = True
+        for info in all_infos:
+            state = info.get("State", {})
+            status = state.get("Status")
+            health = state.get("Health")
+            health_status = health.get("Status") if health else None
+            if status in FAILED_STATES:
+                raise RuntimeError(error_payload(target, state=state))
+            if health_status == "unhealthy":
+                raise RuntimeError(error_payload(target, state=state))
+            if status != "running":
+                all_ready = False
+                continue
+            if health and health_status != "healthy":
+                all_ready = False
+        if all_ready:
+            return all_infos
         time.sleep(2)
     raise TimeoutError(error_payload(target, message="service not ready"))
 
@@ -436,15 +531,30 @@ def service_status(state: dict[str, Any]) -> dict[str, Any]:
     target = str(state.get("target") or "")
     if target not in discover_services():
         return {}
-    info = inspect_target_master_maybe(target)
-    if not info:
+    infos = inspect_target_maybe(target)
+    if not infos:
         return {}
+    healthy_count = 0
+    unhealthy_count = 0
+    no_healthcheck_count = 0
+    for info in infos:
+        container_state = info.get("State", {})
+        health = container_state.get("Health")
+        if not health:
+            no_healthcheck_count += 1
+            continue
+        if health.get("Status") == "healthy":
+            healthy_count += 1
+        elif health.get("Status") == "unhealthy":
+            unhealthy_count += 1
     return {
-        **info.get("State", {}),
+        **infos[0].get("State", {}),
         "logs_tail": current_logs_tail(target, 40),
         "endpoint": endpoint_for(target),
-        "healthcheck_master_label": f"{HEALTHCHECK_MASTER_LABEL}={HEALTHCHECK_MASTER_VALUE}",
-        "container_count": len(project_container_ids(target)),
+        "healthy_container_count": healthy_count,
+        "unhealthy_container_count": unhealthy_count,
+        "no_healthcheck_container_count": no_healthcheck_count,
+        "container_count": len(infos),
     }
 
 

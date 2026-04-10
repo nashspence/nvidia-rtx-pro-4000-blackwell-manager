@@ -2,8 +2,6 @@ services:
   one:
     image: busybox:1.36
     command: ["sh", "-c", "sleep 3600"]
-    labels:
-      gpu.healthcheck-master: "true"
     healthcheck:
       test: ["CMD", "true"]
       interval: 1s
@@ -12,8 +10,6 @@ services:
   two:
     image: busybox:1.36
     command: ["sh", "-c", "sleep 3600"]
-    labels:
-      gpu.healthcheck-master: "true"
     healthcheck:
       test: ["CMD", "true"]
       interval: 1s
