@@ -1,14 +1,14 @@
 services:
   gpu-service-manager:
     build: .
-    image: gpu-service-manager:latest
     container_name: gpu-service-manager
-    restart: unless-stopped
+    environment:
+      GPU_HOST_RUNTIME_DIR: ${GPU_HOST_RUNTIME_DIR}
+      GPU_HOST_SERVICES_DIR: ${GPU_HOST_SERVICES_DIR}
+    image: gpu-service-manager:latest
     ports:
       - "8080:8080"
-    environment:
-      GPU_HOST_SERVICES_DIR: ${GPU_HOST_SERVICES_DIR}
-      GPU_HOST_RUNTIME_DIR: ${GPU_HOST_RUNTIME_DIR}
+    restart: unless-stopped
     volumes:
       - ${GPU_HOST_SERVICES_DIR}:/services
       - ${GPU_HOST_RUNTIME_DIR}:/runtime
