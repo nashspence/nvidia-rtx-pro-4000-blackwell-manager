@@ -386,6 +386,15 @@ def cleanup_queue(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     state = dict(state)
     queue = queue_entries(state)
     changed = False
+
+    if active_lease(state):
+        for entry in queue:
+            if entry.get("claim_expires_at") is not None:
+                entry["claim_expires_at"] = None
+                changed = True
+        state["queue"] = queue
+        return state, changed
+
     while queue:
         head = queue[0]
         claim_expires_at = int(head.get("claim_expires_at") or 0)
@@ -394,9 +403,16 @@ def cleanup_queue(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             changed = True
             continue
         break
+
     if queue and not queue[0].get("claim_expires_at"):
         queue[0]["claim_expires_at"] = now() + QUEUE_CLAIM_WINDOW_S
         changed = True
+
+    for entry in queue[1:]:
+        if entry.get("claim_expires_at") is not None:
+            entry["claim_expires_at"] = None
+            changed = True
+
     state["queue"] = queue
     return state, changed
 
@@ -448,6 +464,8 @@ def acquire(*, target: str, owner: str, lease_token: str, lease_ttl_s: int | flo
     token = lease_token or str(uuid.uuid4())
     expires_at = int(now() + normalize_seconds(lease_ttl_s, DEFAULT_LEASE_TTL_S, "lease_ttl_s"))
     should_wait = False
+    refreshed_lease = False
+    effective_owner = owner or None
 
     with locked():
         state = load_state()
@@ -455,60 +473,72 @@ def acquire(*, target: str, owner: str, lease_token: str, lease_ttl_s: int | flo
         lease = active_lease(state)
 
         if lease and lease.get("token") == lease_token:
+            active_target = str(state.get("target") or "")
+            if active_target != target:
+                raise RuntimeError(f"target mismatch: active:{active_target}; requested:{target}")
             lease["expires_at"] = expires_at
             save_state(state)
-            out = status()
-            out["lease_token"] = lease_token
-            out["lease_expires_at"] = expires_at
-            out["endpoint"] = endpoint_for(target)
-            return out
+            refreshed_lease = True
+        else:
+            idx = queue_index(state, lease_token) if lease_token else None
+            if lease:
+                if idx is not None:
+                    if idx != 0:
+                        raise RuntimeError(f"gpu busy: service:{state['target']}; queue_index:{idx}")
+                    head = queue_entries(state)[0]
+                    if int(head.get("claim_expires_at") or 0) <= now():
+                        state, _ = cleanup_queue(state)
+                        save_state(state)
+                        raise RuntimeError("queued token expired")
+                    raise RuntimeError(f"gpu busy: service:{state['target']}; queue_index:0")
+                if priority is None:
+                    raise RuntimeError(f"gpu busy: service:{state['target']}")
+                queue = queue_entries(state)
+                entry = {
+                    "token": token,
+                    "owner": owner or None,
+                    "target": target,
+                    "priority": int(priority),
+                    "enqueued_at": now(),
+                    "claim_expires_at": None,
+                }
+                queue.append(entry)
+                queue.sort(key=lambda item: (-int(item.get("priority", 0)), int(item.get("enqueued_at", 0))))
+                state["queue"] = queue
+                state, _ = cleanup_queue(state)
+                save_state(state)
+                new_idx = queue_index(state, token)
+                return {"queued": True, "lease_token": token, "queue_index": new_idx, "state": public_state(state), "service": service_status(state) if state.get("mode") == "service" else {}, "services": discover_services()}
 
-        idx = queue_index(state, lease_token) if lease_token else None
-        if lease:
             if idx is not None:
-                if idx != 0:
-                    raise RuntimeError(f"gpu busy: service:{state['target']}; queue_index:{idx}")
                 head = queue_entries(state)[0]
+                queued_target = str(head.get("target") or "")
+                if queued_target and queued_target != target:
+                    raise RuntimeError(f"target mismatch: queued:{queued_target}; requested:{target}")
+                if idx != 0:
+                    raise RuntimeError(f"gpu busy: queue_index:{idx}")
                 if int(head.get("claim_expires_at") or 0) <= now():
                     state, _ = cleanup_queue(state)
                     save_state(state)
                     raise RuntimeError("queued token expired")
-                raise RuntimeError(f"gpu busy: service:{state['target']}; queue_index:0")
-            if priority is None:
-                raise RuntimeError(f"gpu busy: service:{state['target']}")
-            queue = queue_entries(state)
-            entry = {
-                "token": token,
-                "owner": owner or None,
-                "target": target,
-                "priority": int(priority),
-                "enqueued_at": now(),
-                "claim_expires_at": None,
-            }
-            queue.append(entry)
-            queue.sort(key=lambda item: (-int(item.get("priority", 0)), int(item.get("enqueued_at", 0))))
-            state["queue"] = queue
-            state, _ = cleanup_queue(state)
+                effective_owner = effective_owner or head.get("owner")
+                queue = queue_entries(state)
+                queue.pop(0)
+                state["queue"] = queue
+            elif queue_entries(state):
+                raise RuntimeError("gpu busy: queued claimant pending")
+
+            state = ensure_project_running(target, state)
+            state["lease"] = {"token": token, "owner": effective_owner, "expires_at": expires_at}
             save_state(state)
-            new_idx = queue_index(state, token)
-            return {"queued": True, "lease_token": token, "queue_index": new_idx, "state": public_state(state), "service": service_status(state) if state.get("mode") == "service" else {}, "services": discover_services()}
+            should_wait = wait_ready
 
-        if idx is not None:
-            if idx != 0:
-                raise RuntimeError(f"gpu busy: queue_index:{idx}")
-            head = queue_entries(state)[0]
-            if int(head.get("claim_expires_at") or 0) <= now():
-                state, _ = cleanup_queue(state)
-                save_state(state)
-                raise RuntimeError("queued token expired")
-            queue = queue_entries(state)
-            queue.pop(0)
-            state["queue"] = queue
-
-        state = ensure_project_running(target, state)
-        state["lease"] = {"token": token, "owner": owner or None, "expires_at": expires_at}
-        save_state(state)
-        should_wait = wait_ready
+    if refreshed_lease:
+        out = status()
+        out["lease_token"] = lease_token
+        out["lease_expires_at"] = expires_at
+        out["endpoint"] = endpoint_for(target)
+        return out
 
     try:
         if should_wait:
@@ -552,7 +582,7 @@ def api_call(fn):
         raise HTTPException(status_code=504, detail=str(e)) from e
     except RuntimeError as e:
         message = str(e)
-        code = 409 if any(s in message for s in ("gpu busy", "lease", "queued", "queue_index", "expired")) else 500
+        code = 409 if any(s in message for s in ("gpu busy", "lease", "queued", "queue_index", "expired", "target mismatch")) else 500
         raise HTTPException(status_code=code, detail=message) from e
     except subprocess.CalledProcessError as e:
         detail = ((e.stdout or "") + (e.stderr or "")).strip()
