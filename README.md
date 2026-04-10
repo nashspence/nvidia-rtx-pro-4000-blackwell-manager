@@ -65,14 +65,15 @@ The manager invokes Docker as:
 
 That preserves Compose’s normal relative-path behavior, but only if the manager container can see the stack at that same absolute path.
 
-A good convention is to mount a common parent directory once, for example:
+To keep this predictable, prefer explicit mirrored bind mounts for each managed stack based on the actual paths referenced by that stack’s Compose file. For example:
 
 ```yaml
 volumes:
-  - /opt/stacks:/opt/stacks:ro
+  - /opt/stacks/comfyui:/opt/stacks/comfyui:ro
+  - /srv/ml/whisperx:/srv/ml/whisperx:ro
 ```
 
-If stacks live in unrelated places, mount each relevant parent directory individually at its original absolute path.
+If a stack’s Compose file references files outside its own directory, mount the smallest parent directory that covers those relative paths, still mirrored host-to-container at the same absolute path. Avoid catch-all “mount the whole repo somewhere else” examples, because they make relative-path behavior harder to reason about.
 
 ## Repository Layout
 
@@ -132,9 +133,10 @@ services:
         services:
           - name: comfyui
             path: /opt/stacks/comfyui/docker-compose.yml
-          - /opt/stacks/whisperx/compose.yaml
+          - /srv/ml/whisperx/compose.yaml
     volumes:
-      - /opt/stacks:/opt/stacks:ro
+      - /opt/stacks/comfyui:/opt/stacks/comfyui:ro
+      - /srv/ml/whisperx:/srv/ml/whisperx:ro
       - /opt/gpu-service-manager/runtime:/runtime
       - /var/run/docker.sock:/var/run/docker.sock
 ```
@@ -147,19 +149,23 @@ docker compose up -d
 
 This configuration mounts:
 
-- `/opt/stacks` at the same absolute path so existing relative paths in the managed stacks still work
+- `/opt/stacks/comfyui` at the same absolute path the `comfyui` stack uses on the host
+- `/srv/ml/whisperx` at the same absolute path the `whisperx` stack uses on the host
 - `/opt/gpu-service-manager/runtime` at `/runtime`
 - `/var/run/docker.sock`
 
 For local development from this repository:
 
 ```bash
-export REPO_ROOT="$PWD"
-export GPU_HOST_RUNTIME_DIR="$PWD/tests/fixtures/runtime"
 docker compose up -d --build
 ```
 
-The included top-level [`docker-compose.yml`](/workspaces/gpu-service-manager/docker-compose.yml) is a local-dev example that configures the fixture stacks through `GPU_SERVICE_CONFIG_YAML`.
+The included top-level [`docker-compose.yml`](/workspaces/gpu-service-manager/docker-compose.yml) is a local-dev example that mirrors each fixture service directory individually:
+
+- `/workspaces/gpu-service-manager/tests/fixtures/services/dummy-ok` -> same path in the container
+- `/workspaces/gpu-service-manager/tests/fixtures/services/dummy-alt` -> same path in the container
+
+If your checkout lives somewhere other than `/workspaces/gpu-service-manager`, update those bind-mount paths and the matching `GPU_SERVICE_CONFIG_YAML` paths together so they still mirror exactly.
 
 ## API
 

@@ -3,16 +3,18 @@ services:
     build: .
     container_name: gpu-service-manager
     environment:
+      GPU_RUNTIME_DIR: /runtime
       GPU_SERVICE_CONFIG_YAML: |
         services:
           - name: dummy-ok
-            path: ${REPO_ROOT}/tests/fixtures/services/dummy-ok/docker-compose.yml
-          - ${REPO_ROOT}/tests/fixtures/services/dummy-alt/compose.yaml
+            path: /workspaces/gpu-service-manager/tests/fixtures/services/dummy-ok/docker-compose.yml
+          - /workspaces/gpu-service-manager/tests/fixtures/services/dummy-alt/compose.yaml
     image: gpu-service-manager:latest
     ports:
       - "8080:8080"
     restart: unless-stopped
     volumes:
-      - ${REPO_ROOT}:${REPO_ROOT}
-      - ${REPO_ROOT}/runtime:/runtime
+      - /workspaces/gpu-service-manager/tests/fixtures/services/dummy-ok:/workspaces/gpu-service-manager/tests/fixtures/services/dummy-ok:ro
+      - /workspaces/gpu-service-manager/tests/fixtures/services/dummy-alt:/workspaces/gpu-service-manager/tests/fixtures/services/dummy-alt:ro
+      - /workspaces/gpu-service-manager/tests/fixtures/runtime:/runtime
       - /var/run/docker.sock:/var/run/docker.sock

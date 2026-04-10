@@ -1,0 +1,22 @@
+services:
+  gpu-service-manager:
+    environment:
+      # Preferred local pattern:
+      # 1. Override GPU_SERVICE_CONFIG_YAML with the real compose-file paths on your host.
+      # 2. Add one mirrored bind mount per managed stack so each path is visible
+      #    inside gpu-service-manager at the exact same absolute path.
+      # 3. If a stack uses relative paths outside its compose-file directory,
+      #    mount the smallest parent directory that still preserves those paths.
+      GPU_SERVICE_CONFIG_YAML: |
+        services:
+          - /opt/stacks/comfyui/docker-compose.yml
+          - /srv/ml/whisperx/compose.yaml
+    volumes:
+      # Mirror each managed stack at the same host path inside the container.
+      - /opt/stacks/comfyui:/opt/stacks/comfyui:ro
+      - /srv/ml/whisperx:/srv/ml/whisperx:ro
+
+      # Optional example for a stack whose relative paths escape the compose dir:
+      # if /srv/ml/whisperx/compose.yaml refers to ../shared/models, mirror the
+      # parent directory instead of only the compose directory.
+      # - /srv/ml:/srv/ml:ro
