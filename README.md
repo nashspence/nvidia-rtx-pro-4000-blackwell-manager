@@ -59,12 +59,15 @@ That labeled container is the one inspected for Docker health. Acquire fails if:
 ├── docker-compose.yml
 ├── requirements.txt
 ├── requirements-dev.txt
-└── services/
-    └── <target>/
-        └── docker-compose.yml
+└── tests/
+    └── fixtures/
+        ├── runtime/
+        └── services/
+            └── dummy-ok/
+                └── docker-compose.yml
 ```
 
-The repository also includes `services/dummy-*` targets used for local integration and stress testing.
+The repository includes `tests/fixtures/services/dummy-*` targets used for local integration and stress testing. Production service stacks should live outside the repository in whatever host directory you mount as `${GPU_HOST_SERVICES_DIR}`.
 
 ## Configuration
 
@@ -137,10 +140,12 @@ This configuration runs the manager on port `8080` and mounts:
 For local development from this repository, you can still build and run the included top-level Compose file:
 
 ```bash
-export GPU_HOST_SERVICES_DIR="$PWD/services"
-export GPU_HOST_RUNTIME_DIR="$PWD/runtime"
+export GPU_HOST_SERVICES_DIR="$PWD/tests/fixtures/services"
+export GPU_HOST_RUNTIME_DIR="$PWD/tests/fixtures/runtime"
 docker compose up -d --build
 ```
+
+Those paths are test fixtures for local development only. For real usage, point `${GPU_HOST_SERVICES_DIR}` and `${GPU_HOST_RUNTIME_DIR}` at host directories outside the repository.
 
 ## API
 
@@ -241,8 +246,8 @@ Notes:
 
 Runtime state is stored under:
 
-- `runtime/state.json`
-- `runtime/lease.lock`
+- `<configured runtime dir>/state.json`
+- `<configured runtime dir>/lease.lock`
 
 This lets the manager survive restarts without losing the lease and queue model.
 

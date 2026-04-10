@@ -2,3 +2,5 @@
 .pytest_cache
 runtime
 __pycache__
+tests/fixtures/runtime/*
+!tests/fixtures/runtime/.gitkeep

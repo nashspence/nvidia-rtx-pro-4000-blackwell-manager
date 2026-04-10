@@ -16,6 +16,8 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TEST_FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
+SERVICES_FIXTURES_ROOT = TEST_FIXTURES_ROOT / "services"
 DUMMY_SERVICES = (
     "dummy-ok",
     "dummy-alt",
@@ -29,7 +31,7 @@ def _copy_dummy_services(root: Path) -> None:
     services_root = root / "services"
     services_root.mkdir(parents=True, exist_ok=True)
     for name in DUMMY_SERVICES:
-        shutil.copytree(REPO_ROOT / "services" / name, services_root / name)
+        shutil.copytree(SERVICES_FIXTURES_ROOT / name, services_root / name)
 
 
 def _docker_compose_down(root: Path) -> None:
