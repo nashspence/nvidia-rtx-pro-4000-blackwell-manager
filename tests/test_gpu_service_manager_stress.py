@@ -6,6 +6,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -80,7 +81,7 @@ def live_server(tmp_path: Path):
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
             [
-                "/usr/bin/python3",
+                sys.executable,
                 "-m",
                 "uvicorn",
                 "app:app",

@@ -1,2 +1,4 @@
 .env
 .pytest_cache
+runtime
+__pycache__
