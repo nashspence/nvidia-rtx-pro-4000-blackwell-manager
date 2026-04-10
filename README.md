@@ -88,19 +88,59 @@ If `${GPU_ENV_FILE}` exists, it is passed to every `docker compose` invocation w
 
 ## Running It
 
-Set the host directories and start the manager:
+The latest published container image is:
+
+```text
+ghcr.io/nashspence/gpu-service-manager:latest
+```
+
+For a normal deployment, use a minimal `docker-compose.yml` and `.env` like this:
+
+`docker-compose.yml`
+
+```yaml
+services:
+  gpu-service-manager:
+    image: ghcr.io/nashspence/gpu-service-manager:latest
+    container_name: gpu-service-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      GPU_HOST_SERVICES_DIR: ${GPU_HOST_SERVICES_DIR}
+      GPU_HOST_RUNTIME_DIR: ${GPU_HOST_RUNTIME_DIR}
+    volumes:
+      - ${GPU_HOST_SERVICES_DIR}:/services
+      - ${GPU_HOST_RUNTIME_DIR}:/runtime
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+
+`.env`
+
+```dotenv
+GPU_HOST_SERVICES_DIR=/opt/gpu-service-manager/services
+GPU_HOST_RUNTIME_DIR=/opt/gpu-service-manager/runtime
+```
+
+Then start the manager:
+
+```bash
+docker compose up -d
+```
+
+This configuration runs the manager on port `8080` and mounts:
+
+- `${GPU_HOST_SERVICES_DIR}` at `/services`
+- `${GPU_HOST_RUNTIME_DIR}` at `/runtime`
+- `/var/run/docker.sock`
+
+For local development from this repository, you can still build and run the included top-level Compose file:
 
 ```bash
 export GPU_HOST_SERVICES_DIR="$PWD/services"
 export GPU_HOST_RUNTIME_DIR="$PWD/runtime"
 docker compose up -d --build
 ```
-
-The included top-level Compose file runs the manager on port `8080` and mounts:
-
-- `${GPU_HOST_SERVICES_DIR}` at `/services`
-- `${GPU_HOST_RUNTIME_DIR}` at `/runtime`
-- `/var/run/docker.sock`
 
 ## API
 
